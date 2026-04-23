@@ -19,7 +19,7 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 
-const LARAVEL_API_URL = 'http://127.0.0.1:8000/api';
+const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://127.0.0.1:8000/api';
 const LARAVEL_API_ROUTES = {
     sessionsQrStore: `${LARAVEL_API_URL}/sessions/qr`,
     accountStatusUpdate: (accountId) => `${LARAVEL_API_URL}/accounts/${accountId}/status`,
@@ -672,10 +672,25 @@ app.get('/sessions', (req, res) => {
     res.json(status);
 });
 
+/**
+ * Health checks for Render and uptime monitoring
+ */
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        service: 'whatsapp-node',
+        active_sessions: sessions.size
+    });
+});
+
+app.get('/healthz', (req, res) => {
+    res.status(200).send('ok');
+});
+
 // Start Express Server
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
-    console.log(`Multi-Session WhatsApp Bridge running on http://localhost:3000`);
+    console.log(`Multi-Session WhatsApp Bridge running on port ${PORT}`);
     
     // AUTO-RESUME: Reconnect all accounts found in the sessions directory
     const sessionsDir = path.join(__dirname, 'sessions');
