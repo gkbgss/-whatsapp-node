@@ -18,6 +18,7 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
+const bootTime = new Date().toISOString();
 
 const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://127.0.0.1:8000/api';
 const LARAVEL_API_ROUTES = {
@@ -673,6 +674,13 @@ app.get('/sessions', (req, res) => {
 });
 
 /**
+ * Quick browser check endpoint
+ */
+app.get('/', (req, res) => {
+    res.status(200).send('whatsapp-node is running');
+});
+
+/**
  * Health checks for Render and uptime monitoring
  */
 app.get('/health', (req, res) => {
@@ -685,6 +693,20 @@ app.get('/health', (req, res) => {
 
 app.get('/healthz', (req, res) => {
     res.status(200).send('ok');
+});
+
+/**
+ * Detailed runtime status endpoint
+ */
+app.get('/status', (req, res) => {
+    res.status(200).json({
+        status: 'running',
+        service: 'whatsapp-node',
+        boot_time: bootTime,
+        now: new Date().toISOString(),
+        active_sessions: sessions.size,
+        uptime_seconds: Math.floor(process.uptime())
+    });
 });
 
 // Start Express Server
