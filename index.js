@@ -1,726 +1,767 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
+/**
+ * WhatsApp Multi-Session Bridge
+ * Complete LID resolution fix — event-driven, not timed.
+ *
+ * Strategy:
+ *  1. Persistent lidMap per session (never discarded)
+ *  2. contacts.upsert is the PRIMARY source of LID→PN pairs (fires reliably after key exchange)
+ *  3. History sync stores chats under @lid as placeholders, contacts.upsert patches them
+ *  4. Live messages also patch the lidMap and trigger deferred placeholder resolution
+ *  5. Multiple retry waves: 5s, 15s, 30s, 60s after history sync
+ */
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     jidNormalizedUser,
     isLidUser,
-    isPnUser
+    isPnUser,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const express = require('express');
-const axios = require('axios');
-const qrcode = require('qrcode-terminal');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
+const express  = require('express');
+const axios    = require('axios');
+const pino     = require('pino');
+const fs       = require('fs');
+const path     = require('path');
 
 const app = express();
 app.use(express.json());
 const bootTime = new Date().toISOString();
 
-const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'https://quickmed.technoderivation.com/technochain/api';
-const LARAVEL_API_ROUTES = {
-    sessionsQrStore: `${LARAVEL_API_URL}/sessions/qr`,
-    accountStatusUpdate: (accountId) => `${LARAVEL_API_URL}/accounts/${accountId}/status`,
-    accountProfileSync: (accountId) => `${LARAVEL_API_URL}/accounts/${accountId}/sync-profile`,
-    chatHistorySync: `${LARAVEL_API_URL}/sync-history`,
-    chatReceiveMessage: `${LARAVEL_API_URL}/receive-message`
+const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://127.0.0.1:8000/api';
+const API = {
+    qrStore:        `${LARAVEL_API_URL}/sessions/qr`,
+    statusUpdate:   (id) => `${LARAVEL_API_URL}/accounts/${id}/status`,
+    profileSync:    (id) => `${LARAVEL_API_URL}/accounts/${id}/sync-profile`,
+    historySync:    `${LARAVEL_API_URL}/sync-history`,
+    receiveMessage: `${LARAVEL_API_URL}/receive-message`,
 };
 
-// Store active sessions (accountId -> socket)
-const sessions = new Map();
-// Dedup auto-replies so one incoming message gets one AI reply.
-const autoReplyDedup = new Map();
+// ── Global stores ────────────────────────────────────────────────────────────
+const sessions       = new Map();  // sessionId → socket
+const autoReplyDedup = new Map();  // dedupKey  → expiresAt
 
-/**
- * Helper: Extract text or label from complex message objects
- */
+// PERSISTENT LID→PN map per session. Never recreated, only grows.
+// KEY INSIGHT: contacts.upsert is the most reliable source — it fires
+// after WhatsApp completes key exchange and contains proper phone numbers.
+const lidMaps = new Map(); // sessionId → Map<normalizedLidJid, normalizedPnJid>
+
+// Unresolved @lid chat placeholders waiting to be patched when contacts arrive
+const lidPlaceholders = new Map(); // sessionId → Map<lidJid, chatRowData>
+
+// Retry timers for each session
+const retryTimers = new Map(); // sessionId → [timeoutId, ...]
+
+function getLidMap(sid) {
+    const k = String(sid);
+    if (!lidMaps.has(k)) lidMaps.set(k, new Map());
+    return lidMaps.get(k);
+}
+function getLidPlaceholders(sid) {
+    const k = String(sid);
+    if (!lidPlaceholders.has(k)) lidPlaceholders.set(k, new Map());
+    return lidPlaceholders.get(k);
+}
+function clearRetryTimers(sid) {
+    const k = String(sid);
+    const timers = retryTimers.get(k) || [];
+    timers.forEach(t => clearTimeout(t));
+    retryTimers.delete(k);
+}
+function addRetryTimer(sid, fn, ms) {
+    const k = String(sid);
+    if (!retryTimers.has(k)) retryTimers.set(k, []);
+    retryTimers.get(k).push(setTimeout(fn, ms));
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
 const getMessageText = (m) => {
-    const msg = m.message;
+    const msg = m?.message;
     if (!msg) return null;
-
-    // 1. Direct Conversation
-    if (msg.conversation) return msg.conversation;
-
-    // 2. Extended Text (links, formatting)
-    if (msg.extendedTextMessage) return msg.extendedTextMessage.text;
-
-    // 3. Image Message
-    if (msg.imageMessage) {
-        return msg.imageMessage.caption ? `📷 ${msg.imageMessage.caption}` : '📷 [PHOTO]';
-    }
-
-    // 4. Video Message
-    if (msg.videoMessage) {
-        return msg.videoMessage.caption ? `🎥 ${msg.videoMessage.caption}` : '🎥 [VIDEO]';
-    }
-
-    // 5. Audio Message
-    if (msg.audioMessage) return '🎵 [AUDIO]';
-
-    // 6. Document Message
-    if (msg.documentMessage) {
-        return msg.documentMessage.fileName ? `📄 ${msg.documentMessage.fileName}` : '📄 [DOCUMENT]';
-    }
-
-    // 7. Sticker Message
-    if (msg.stickerMessage) return '😜 [STICKER]';
-
-    // 8. View Once Messages
+    if (msg.conversation)                             return msg.conversation;
+    if (msg.extendedTextMessage)                      return msg.extendedTextMessage.text;
+    if (msg.imageMessage)                             return msg.imageMessage.caption ? `📷 ${msg.imageMessage.caption}` : '📷 [PHOTO]';
+    if (msg.videoMessage)                             return msg.videoMessage.caption ? `🎥 ${msg.videoMessage.caption}` : '🎥 [VIDEO]';
+    if (msg.audioMessage)                             return '🎵 [AUDIO]';
+    if (msg.documentMessage)                          return msg.documentMessage.fileName ? `📄 ${msg.documentMessage.fileName}` : '📄 [DOCUMENT]';
+    if (msg.stickerMessage)                           return '😜 [STICKER]';
     if (msg.viewOnceMessageV2?.message?.imageMessage) return '📷 [VIEW ONCE PHOTO]';
     if (msg.viewOnceMessageV2?.message?.videoMessage) return '🎥 [VIEW ONCE VIDEO]';
-
+    if (msg.reactionMessage)                          return `${msg.reactionMessage.text || '👍'} [REACTION]`;
+    if (msg.pollCreationMessage)                      return `📊 [POLL] ${msg.pollCreationMessage.name || ''}`;
+    if (msg.ephemeralMessage)                         return getMessageText({ message: msg.ephemeralMessage.message });
+    if (msg.viewOnceMessage)                          return getMessageText({ message: msg.viewOnceMessage.message });
     return '[Media/Other]';
 };
 
-/**
- * Helper: Simple async delay
- */
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+function safeNorm(jid) {
+    if (!jid) return '';
+    try { return jidNormalizedUser(jid); } catch (_) { return ''; }
+}
+
+function toPhoneJid(raw) {
+    if (!raw) return null;
+    const s = String(raw);
+    if (s.includes('@')) return safeNorm(s);
+    const d = s.replace(/\D/g, '');
+    return d ? `${d}@s.whatsapp.net` : null;
+}
 
 /**
- * Build LID → phone JID map from history contacts (phoneNumber + lid) and message keys.
- * History often lists chats by @lid before getPNForLID is populated; contacts carry the real number.
+ * Feed LID↔PN pairs into the shared persistent map from any source.
+ * Safe to call multiple times — just keeps adding/updating entries.
  */
-function buildLidToPhoneMap(contacts, messages, historyChats = []) {
-    const map = new Map();
-    const addPair = (lidJid, pnJid) => {
-        if (!lidJid || !pnJid) return;
-        const l = jidNormalizedUser(lidJid);
-        let p = pnJid;
-        if (p && !String(p).includes('@')) {
-            const digits = String(p).replace(/\D/g, '');
-            if (digits) p = `${digits}@s.whatsapp.net`;
-        } else if (p) {
-            p = jidNormalizedUser(p);
-        }
-        if (l && p && isLidUser(l) && isPnUser(p)) map.set(l, p);
+function feedLidMap(lidMap, { contacts = [], messages = [], chats = [] }) {
+    const add = (lid, pn) => {
+        if (!lid || !pn) return;
+        try {
+            const l = safeNorm(lid);
+            const p = toPhoneJid(pn);
+            if (l && p && isLidUser(l) && isPnUser(p)) lidMap.set(l, p);
+        } catch (_) {}
     };
-    // Baileys history: each chat may have id (often @lid), lidJid, pnJid (real phone JID)
-    for (const ch of historyChats || []) {
-        if (!ch?.pnJid) continue;
-        if (ch.lidJid) addPair(ch.lidJid, ch.pnJid);
-        if (ch.id && isLidUser(jidNormalizedUser(ch.id))) addPair(ch.id, ch.pnJid);
-    }
-    for (const c of contacts || []) {
-        if (!c.phoneNumber) continue;
-        if (c.lid) addPair(c.lid, c.phoneNumber);
-        if (c.id && isLidUser(jidNormalizedUser(c.id))) addPair(c.id, c.phoneNumber);
-    }
-    for (const m of messages || []) {
-        if (!m.key) continue;
-        const r = m.key.remoteJid ? jidNormalizedUser(m.key.remoteJid) : '';
-        const ra = m.key.remoteJidAlt ? jidNormalizedUser(m.key.remoteJidAlt) : '';
-        if (r && ra) {
-            if (isLidUser(r) && isPnUser(ra)) addPair(r, ra);
-            if (isLidUser(ra) && isPnUser(r)) addPair(ra, r);
+
+    // Chats: pnJid field is the most authoritative source
+    for (const ch of chats) {
+        if (!ch) continue;
+        if (ch.pnJid) {
+            if (ch.lidJid) add(ch.lidJid, ch.pnJid);
+            const id = safeNorm(ch.id || '');
+            if (id && isLidUser(id)) add(ch.id, ch.pnJid);
         }
     }
-    return map;
+    // Contacts: phoneNumber field
+    for (const c of contacts) {
+        if (!c?.phoneNumber) continue;
+        if (c.lid) add(c.lid, c.phoneNumber);
+        const id = safeNorm(c.id || '');
+        if (id && isLidUser(id)) add(c.id, c.phoneNumber);
+    }
+    // Messages: remoteJid vs remoteJidAlt cross-pairing
+    for (const m of messages) {
+        if (!m?.key) continue;
+        try {
+            const r  = safeNorm(m.key.remoteJid    || '');
+            const ra = safeNorm(m.key.remoteJidAlt || '');
+            if (r && ra) {
+                if (isLidUser(r)  && isPnUser(ra)) add(r, ra);
+                if (isLidUser(ra) && isPnUser(r))  add(ra, r);
+            }
+        } catch (_) {}
+    }
 }
 
-function pnFromLidMap(lidToPnMap, jid) {
-    if (!jid || !lidToPnMap) return null;
-    const n = jidNormalizedUser(jid);
-    if (!n || !isLidUser(n)) return null;
-    const pn = lidToPnMap.get(n);
-    return pn ? jidNormalizedUser(pn) : null;
+function resolveFromMap(lidMap, jid) {
+    if (!jid) return null;
+    try {
+        const n = safeNorm(jid);
+        if (!n || !isLidUser(n)) return null;
+        const v = lidMap.get(n);
+        return v || null;
+    } catch (_) { return null; }
 }
 
 /**
- * Stable DB key for 1:1 chats: always prefer phone JID (@s.whatsapp.net).
- * WhatsApp often sends LID in remoteJid but the phone in remoteJidAlt — same as WhatsApp Web.
+ * THE main JID resolver.
+ * Priority: persistent map → already a PN JID → signalRepository → give up (still @lid)
  */
-async function canonicalUserJidFromParts(socket, remoteJid, remoteJidAlt, lidToPnMap = null) {
-    const mapped =
-        pnFromLidMap(lidToPnMap, remoteJid) || pnFromLidMap(lidToPnMap, remoteJidAlt);
-    if (mapped) return mapped;
+async function resolveJid(socket, jid, jidAlt, lidMap) {
+    // 1. Persistent map (O(1), covers 99% of cases after contacts arrive)
+    const fromMap = resolveFromMap(lidMap, jid) || resolveFromMap(lidMap, jidAlt);
+    if (fromMap) return fromMap;
 
-    const a = remoteJid ? jidNormalizedUser(remoteJid) : '';
-    const b = remoteJidAlt ? jidNormalizedUser(remoteJidAlt) : '';
+    // 2. Already a phone JID
+    const a = safeNorm(jid    || '');
+    const b = safeNorm(jidAlt || '');
     if (a && isPnUser(a)) return a;
     if (b && isPnUser(b)) return b;
-    if (a && isLidUser(a)) {
-        try {
-            const pn = await socket.signalRepository.lidMapping.getPNForLID(a);
-            if (pn) return jidNormalizedUser(pn);
-        } catch (e) {
-            console.warn('[JID] getPNForLID failed for remoteJid:', e.message);
-        }
-    }
-    if (b && isLidUser(b)) {
-        try {
-            const pn = await socket.signalRepository.lidMapping.getPNForLID(b);
-            if (pn) return jidNormalizedUser(pn);
-        } catch (e) {
-            console.warn('[JID] getPNForLID failed for remoteJidAlt:', e.message);
-        }
-    }
-    return a || b || remoteJid;
-}
 
-/** When only one jid is known (e.g. chat list id). */
-async function toCanonicalDmJid(socket, jid, lidToPnMap = null) {
-    return canonicalUserJidFromParts(socket, jid, undefined, lidToPnMap);
+    // 3. signalRepository.lidMapping (async, may fail if called too early)
+    for (const lid of [a, b]) {
+        if (!lid || !isLidUser(lid)) continue;
+        try {
+            const pn = await socket.signalRepository.lidMapping.getPNForLID(lid);
+            if (pn) {
+                const resolved = safeNorm(pn);
+                if (lidMap && isPnUser(resolved)) {
+                    lidMap.set(lid, resolved); // cache back
+                }
+                return resolved;
+            }
+        } catch (_) {}
+    }
+
+    // 4. Still @lid — caller decides what to do
+    return a || b || jid;
 }
 
 /**
- * Helper: Simulate human behavior (Typing... -> Wait -> Send)
+ * POST a batch of conversations to Laravel, chunked to avoid huge payloads.
  */
-const sendWithTyping = async (socket, jid, text, type = 'composing', typingDelayOverrideMs = null) => {
-    // 1. Show presence (typing...) if supported by current Baileys build
-    try {
-        if (typeof socket.presenceObserve === 'function') {
-            await socket.presenceObserve(jid);
+async function postHistoryBatch(sessionId, conversations) {
+    if (!conversations.length) return;
+    const CHUNK = 50;
+    for (let i = 0; i < conversations.length; i += CHUNK) {
+        const chunk = conversations.slice(i, i + CHUNK);
+        try {
+            await axios.post(API.historySync, { account_id: sessionId, conversations: chunk });
+        } catch (e) {
+            console.error(`[HISTORY] batch post failed (chunk ${i}):`, e.message);
         }
-        if (typeof socket.sendPresenceUpdate === 'function') {
-            await socket.sendPresenceUpdate(type, jid);
-        }
-    } catch (e) {
-        console.warn(`[AUTO-REPLY] Presence simulation skipped: ${e.message}`);
     }
-    
-    // 2. Human-like wait (based on text length)
-    const waitTime = typingDelayOverrideMs === null
-        ? Math.min(Math.max(text.length * 50, 2000), 7000)
-        : Math.max(0, Number(typingDelayOverrideMs) || 0);
-    await delay(waitTime);
-    
-    // 3. Stop presence (best effort)
-    try {
-        if (typeof socket.sendPresenceUpdate === 'function') {
-            await socket.sendPresenceUpdate('paused', jid);
-        }
-    } catch (e) {}
-    
-    // 4. Send Message
-    return await socket.sendMessage(jid, { text });
-};
+}
 
 /**
- * Initialize a WhatsApp session for a specific account
+ * Resolve all pending @lid placeholders using the current lidMap state.
+ * Called on each retry wave and also when contacts.upsert fires.
  */
+async function flushLidPlaceholders(sessionId, socket) {
+    const placeholders = getLidPlaceholders(sessionId);
+    if (!placeholders.size) return 0;
+
+    const lidMap  = getLidMap(sessionId);
+    const flushed = [];
+
+    for (const [rawLid, row] of placeholders.entries()) {
+        let resolved = resolveFromMap(lidMap, rawLid);
+
+        if (!resolved) {
+            // Try signalRepository on this flush attempt
+            try {
+                const pn = await socket.signalRepository.lidMapping.getPNForLID(rawLid).catch(() => null);
+                if (pn) {
+                    resolved = safeNorm(pn);
+                    if (resolved && isPnUser(resolved)) {
+                        lidMap.set(safeNorm(rawLid), resolved);
+                    } else {
+                        resolved = null;
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (!resolved) continue; // still unresolved — leave in map
+
+        // Fetch avatar now that we have the real JID
+        let avatarUrl = row.avatar_url;
+        if (!avatarUrl) {
+            avatarUrl = await socket.profilePictureUrl(resolved, 'image').catch(() => null);
+        }
+
+        // Patch the row with the real JID
+        const legacyIds = [...new Set([...(row.legacy_chat_ids || []), safeNorm(rawLid)])].filter(Boolean);
+        flushed.push({ ...row, id: resolved, avatar_url: avatarUrl, legacy_chat_ids: legacyIds });
+        placeholders.delete(rawLid);
+    }
+
+    if (flushed.length) {
+        console.log(`[LID-FLUSH] Resolved ${flushed.length} placeholder(s) for session ${sessionId}`);
+        await postHistoryBatch(sessionId, flushed);
+    }
+
+    return flushed.length;
+}
+
+// ── Session initialiser ───────────────────────────────────────────────────────
 async function initSession(sessionId) {
-    console.log(`[SESSION] Initializing for account: ${sessionId}`);
-    
-    // Session persistence per account
-    const sessionDir = path.join(__dirname, 'sessions', sessionId.toString());
-    
-    // Ensure sessions directory exists
-    if (!fs.existsSync(path.join(__dirname, 'sessions'))) {
-        fs.mkdirSync(path.join(__dirname, 'sessions'));
-    }
+    const sid = String(sessionId);
+    console.log(`[SESSION] Initialising: ${sid}`);
+
+    const sessionDir = path.join(__dirname, 'sessions', sid);
+    fs.mkdirSync(sessionDir, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version, isLatest } = await fetchLatestBaileysVersion();
+    const { version }          = await fetchLatestBaileysVersion();
 
     const socket = makeWASocket({
         version,
-        auth: state,
-        printQRInTerminal: true, // Keep it true for terminal debugging too
-        logger: pino({ level: 'silent' }),
-        browser: ['Windows', 'Chrome', '11.0.0']
+        auth: {
+            creds: state.creds,
+            keys:  makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
+        logger:  pino({ level: 'silent' }),
+        browser: ['Windows', 'Chrome', '124.0.0'],
+        getMessage: async () => undefined,
+        syncFullHistory: true,
     });
 
-    sessions.set(sessionId.toString(), socket);
-
-    // Save credentials whenever they are updated
+    sessions.set(sid, socket);
     socket.ev.on('creds.update', saveCreds);
 
-    // Monitor connection status
-    socket.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
+    // ── connection.update ────────────────────────────────────────────────────
+    socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (qr) {
-            console.log(`[QR] Generated for account ${sessionId}. Sending to Laravel...`);
-            // Broadcast QR to Laravel so it can show it on the dashboard
-            try {
-                await axios.post(LARAVEL_API_ROUTES.sessionsQrStore, {
-                    account_id: sessionId,
-                    qr: qr
-                });
-                console.log(`[QR] Successfully sent to Laravel for ${sessionId}`);
-            } catch (err) {
-                console.error(`[QR] FAILED to send to Laravel for ${sessionId}:`, err.message);
-            }
+            console.log(`[QR] ${sid}`);
+            try { await axios.post(API.qrStore, { account_id: sessionId, qr }); } catch (e) {}
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error instanceof Boom) ? 
-                lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut : true;
-            
-            console.log(`Connection for ${sessionId} closed. Reconnecting:`, shouldReconnect);
-            
-            if (shouldReconnect) {
+            clearRetryTimers(sid);
+            const code = (lastDisconnect?.error instanceof Boom)
+                ? lastDisconnect.error?.output?.statusCode : null;
+            const reconnect = code !== DisconnectReason.loggedOut;
+            console.log(`[SESSION] Closed ${sid}. Code: ${code}. Reconnect: ${reconnect}`);
+
+            if (reconnect) {
+                await delay(3000);
                 initSession(sessionId);
             } else {
-                console.log(`Account ${sessionId} logged out. Cleaning up...`);
-                sessions.delete(sessionId.toString());
-                
-                // Update Laravel status to 'disconnected'
+                sessions.delete(sid);
+                lidMaps.delete(sid);
+                lidPlaceholders.delete(sid);
                 try {
-                    await axios.patch(LARAVEL_API_ROUTES.accountStatusUpdate(sessionId), {
-                        status: 'disconnected',
-                        phone_number: null
-                    });
-                } catch (err) {
-                    console.error(`Failed to update logout status for ${sessionId}:`, err.message);
-                }
+                    await axios.patch(API.statusUpdate(sessionId), { status: 'disconnected', phone_number: null });
+                } catch (_) {}
             }
         } else if (connection === 'open') {
-            console.log(`WhatsApp account ${sessionId} opened successfully!`);
-            
-            // Get own info
-            const me = socket.user.id.split(':')[0];
+            console.log(`[SESSION] Connected: ${sid}`);
+            const me     = socket.user.id.split(':')[0];
             const myName = socket.user.name || null;
-            let myAvatar = null;
-
+            const myAvatar = await socket.profilePictureUrl(socket.user.id, 'image').catch(() => null);
             try {
-                myAvatar = await socket.profilePictureUrl(socket.user.id, 'image').catch(() => null);
-            } catch (e) {
-                console.log(`[PROFILE] Could not fetch own avatar for ${sessionId}`);
-            }
+                await axios.post(API.profileSync(sessionId), { phone: me, user_name: myName, avatar_url: myAvatar });
+                await axios.patch(API.statusUpdate(sessionId), { status: 'active', phone_number: me });
+            } catch (e) { console.error('[PROFILE]', e.message); }
+        }
+    });
 
-            // Sync full profile metadata with Laravel
-            try {
-                await axios.post(LARAVEL_API_ROUTES.accountProfileSync(sessionId), {
-                    phone: me,
-                    user_name: myName,
-                    avatar_url: myAvatar
-                });
-                console.log(`[PROFILE] Synced own identity for ${sessionId}: ${myName || me}`);
-            } catch (err) {
-                console.error(`[PROFILE] FAILED to sync identity for ${sessionId}:`, err.message);
+    // ── contacts.upsert ──────────────────────────────────────────────────────
+    // PRIMARY LID resolver. WhatsApp sends proper phone numbers here AFTER
+    // the session key exchange is complete. This patches all @lid placeholders.
+    socket.ev.on('contacts.upsert', async (contacts) => {
+        const lidMap = getLidMap(sid);
+        const before = lidMap.size;
+        feedLidMap(lidMap, { contacts });
+        const added = lidMap.size - before;
+
+        console.log(`[CONTACTS] ${sid}: ${contacts.length} contacts upserted, +${added} new LID pairs. Total: ${lidMap.size}`);
+
+        if (added > 0 || contacts.length > 0) {
+            const flushed = await flushLidPlaceholders(sid, socket);
+            if (flushed > 0) {
+                console.log(`[CONTACTS] Flushed ${flushed} @lid chat(s) to real phone JIDs`);
             }
         }
     });
-    
-    // Listen for initial history sync (past chats and messages)
-    socket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
-        console.log(`[HISTORY] Received ${chats.length} chats, ${contacts.length} contacts, and ${messages.length} messages`);
-        
-        // Build a name map from the contacts provided (key by id, LID, and phone JID)
-        const contactMap = new Map();
-        contacts.forEach(c => {
+
+    // ── contacts.update ──────────────────────────────────────────────────────
+    socket.ev.on('contacts.update', async (contacts) => {
+        feedLidMap(getLidMap(sid), { contacts });
+        await flushLidPlaceholders(sid, socket);
+    });
+
+    // ── chats.upsert ─────────────────────────────────────────────────────────
+    socket.ev.on('chats.upsert', async (chats) => {
+        feedLidMap(getLidMap(sid), { chats });
+        await flushLidPlaceholders(sid, socket);
+    });
+
+    // ── chats.update ─────────────────────────────────────────────────────────
+    socket.ev.on('chats.update', async (chats) => {
+        feedLidMap(getLidMap(sid), { chats });
+        await flushLidPlaceholders(sid, socket);
+    });
+
+    // ── messaging-history.set ────────────────────────────────────────────────
+    socket.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
+        console.log(`[HISTORY] ${sid}: ${chats.length} chats | ${contacts.length} contacts | ${messages.length} msgs`);
+
+        const lidMap = getLidMap(sid);
+
+        // Phase 1: Feed everything we have into the LID map
+        feedLidMap(lidMap, { chats, contacts, messages });
+        console.log(`[HISTORY] LID map: ${lidMap.size} entries after initial feed`);
+
+        // Build name lookup table
+        const nameMap = new Map();
+        for (const c of contacts) {
             const name = c.name || c.notify || c.verifiedName || null;
-            if (!name) return;
-            contactMap.set(c.id, name);
-            if (c.phoneNumber) {
-                const pn = String(c.phoneNumber).includes('@')
-                    ? jidNormalizedUser(c.phoneNumber)
-                    : `${String(c.phoneNumber).replace(/\D/g, '')}@s.whatsapp.net`;
-                contactMap.set(pn, name);
-            }
-        });
-
-        const lidToPnMap = buildLidToPhoneMap(contacts, messages, chats);
-
-        // SORT CHATS by conversationTimestamp (most recent first) and LIMIT to top 50
-        const sortedChats = chats
-            .filter(c => !c.id.includes('status@broadcast')) // Ignore status updates
-            .sort((a, b) => (Number(b.conversationTimestamp || 0)) - (Number(a.conversationTimestamp || 0)))
-            .slice(0, 50);
-
-        console.log(`[HISTORY] Processing top ${sortedChats.length} most recent chats...`);
-
-        // Pre-resolve using remoteJid + remoteJidAlt + contact LID map (LID/PN pairs)
-        const canonicalByRemote = new Map();
-        for (const m of messages) {
-            const r = jidNormalizedUser(m.key.remoteJid);
-            if (!r || canonicalByRemote.has(r)) continue;
-            const c = await canonicalUserJidFromParts(socket, m.key.remoteJid, m.key.remoteJidAlt, lidToPnMap);
-            canonicalByRemote.set(r, c);
+            if (!name) continue;
+            const id = safeNorm(c.id || '');
+            if (id) nameMap.set(id, name);
+            if (c.lid) nameMap.set(safeNorm(c.lid), name);
+            const pn = toPhoneJid(c.phoneNumber);
+            if (pn) nameMap.set(pn, name);
+        }
+        for (const ch of chats) {
+            if (ch.name && ch.id) nameMap.set(safeNorm(ch.id), ch.name);
         }
 
-        const syncData = await Promise.all(sortedChats.map(async (chat) => {
-            const cn = jidNormalizedUser(chat.id);
-            const sampleMsg = messages.find(m => {
-                const r = jidNormalizedUser(m.key.remoteJid);
-                const ra = m.key.remoteJidAlt ? jidNormalizedUser(m.key.remoteJidAlt) : '';
-                return (r && r === cn) || (ra && ra === cn);
-            });
+        // Phase 2: Pre-resolve all message JIDs in batches
+        const resolvedJidCache = new Map();
+        const msgJids = [...new Set(messages.map(m => m?.key?.remoteJid).filter(Boolean))];
+        for (let i = 0; i < msgJids.length; i += 20) {
+            await Promise.all(msgJids.slice(i, i + 20).map(async (rawJid) => {
+                const norm = safeNorm(rawJid);
+                if (resolvedJidCache.has(norm)) return;
+                const m = messages.find(x => x?.key?.remoteJid === rawJid);
+                const canon = await resolveJid(socket, rawJid, m?.key?.remoteJidAlt, lidMap);
+                resolvedJidCache.set(norm, canon);
+            }));
+        }
 
-            const canonicalChatId = await canonicalUserJidFromParts(
-                socket,
-                chat.id,
-                sampleMsg?.key?.remoteJidAlt,
-                lidToPnMap
-            );
+        // Phase 3: Group messages by canonical chat JID
+        const msgsByCanon = new Map();
+        for (const m of messages) {
+            if (!m?.key?.remoteJid) continue;
+            const norm  = safeNorm(m.key.remoteJid);
+            const canon = resolvedJidCache.get(norm) || norm;
+            if (!msgsByCanon.has(canon)) msgsByCanon.set(canon, []);
+            msgsByCanon.get(canon).push(m);
+        }
 
-            const resolvedName =
-                contactMap.get(chat.id) ||
-                contactMap.get(canonicalChatId) ||
-                (sampleMsg && contactMap.get(jidNormalizedUser(sampleMsg.key.remoteJid))) ||
-                chat.name ||
-                null;
+        // Phase 4: Process each DM chat
+        const resolved   = [];
+        const placeholds = [];
 
-            // Prefer phone JID for profile picture (same as WhatsApp Web)
+        const filteredChats = chats.filter(c =>
+            c?.id &&
+            !c.id.includes('status@broadcast') &&
+            !c.id.includes('@newsletter') &&
+            !c.id.includes('@broadcast')
+        ).sort((a, b) => Number(b.conversationTimestamp || 0) - Number(a.conversationTimestamp || 0));
+
+        for (const chat of filteredChats) {
+            let canonId  = await resolveJid(socket, chat.id, undefined, lidMap);
+            const chatNorm = safeNorm(chat.id);
+
+            // Extra direct attempt via signalRepository
+            if (isLidUser(safeNorm(canonId))) {
+                try {
+                    const pn = await socket.signalRepository.lidMapping.getPNForLID(chat.id).catch(() => null);
+                    if (pn) {
+                        canonId = safeNorm(pn);
+                        lidMap.set(chatNorm, canonId);
+                    }
+                } catch (_) {}
+            }
+
+            const stillLid = isLidUser(safeNorm(canonId));
+
+            // Collect messages
+            const chatMsgs = [];
+            const seen     = new Set();
+            const allMsgs  = [
+                ...(msgsByCanon.get(canonId)  || []),
+                ...(msgsByCanon.get(chatNorm) || []),
+            ];
+            for (const m of allMsgs) {
+                if (!m?.key?.id || seen.has(m.key.id)) continue;
+                seen.add(m.key.id);
+                chatMsgs.push({
+                    id:        m.key.id,
+                    fromMe:    m.key.fromMe || false,
+                    text:      getMessageText(m) || '[Media/Other]',
+                    timestamp: m.messageTimestamp ? Number(m.messageTimestamp) : Math.floor(Date.now() / 1000),
+                });
+            }
+            chatMsgs.sort((a, b) => b.timestamp - a.timestamp);
+            const topMsgs = chatMsgs.slice(0, 100);
+
+            if (!topMsgs.length) {
+                topMsgs.push({
+                    id:        `placeholder-${chat.id}-${Date.now()}`,
+                    fromMe:    false,
+                    text:      chat.lastMessage ? (getMessageText(chat.lastMessage) || '[History syncing…]') : '[No messages synced]',
+                    timestamp: chat.conversationTimestamp ? Number(chat.conversationTimestamp) : Math.floor(Date.now() / 1000),
+                });
+            }
+
+            const latestTs = topMsgs[0].timestamp;
+            const preview  = topMsgs[0].text;
+            const legacyIds = (chatNorm && chatNorm !== canonId) ? [chatNorm] : [];
+
+            // Skip avatar fetch for @lid (fetch when flushed, after we have the real JID)
             let avatarUrl = null;
-            try {
-                avatarUrl = await socket.profilePictureUrl(canonicalChatId, 'image').catch(() => null);
-                if (!avatarUrl) {
-                    avatarUrl = await socket.profilePictureUrl(chat.id, 'image').catch(() => null);
-                }
-            } catch (e) {}
-
-            const chatMessages = messages
-                .filter(m => {
-                    const r = jidNormalizedUser(m.key.remoteJid);
-                    const canonMsg = canonicalByRemote.get(r);
-                    return canonMsg === canonicalChatId;
-                })
-                .map(m => {
-                    return {
-                        id: m.key.id,
-                        fromMe: m.key.fromMe || false,
-                        text: getMessageText(m) || "[Media/Other]",
-                        timestamp: m.messageTimestamp ? Number(m.messageTimestamp) : Math.floor(Date.now() / 1000)
-                    };
-                })
-                .sort((a, b) => b.timestamp - a.timestamp) // Sort descending (newest first)
-                .slice(0, 100);
-
-            // DETERMINE PREVIEW TEXT (Match WhatsApp Web priority)
-            // 1. Newest from history messages array
-            // 2. Fallback to Baileys chat.lastMessage property
-            // 3. Last fallback to "New Conversation"
-            let previewText = "New Conversation";
-            if (chatMessages.length > 0) {
-                previewText = chatMessages[0].text;
-            } else if (chat.lastMessage) {
-                previewText = getMessageText(chat.lastMessage) || "History Syncing...";
+            if (!stillLid) {
+                avatarUrl = await socket.profilePictureUrl(canonId, 'image')
+                    .catch(() => socket.profilePictureUrl(chat.id, 'image').catch(() => null));
             }
 
-            // Use conversationTimestamp as fallback if no messages found
-            const fallbackTs = chat.conversationTimestamp ? Number(chat.conversationTimestamp) : Math.floor(Date.now() / 1000);
+            const resolvedName = nameMap.get(chatNorm) || nameMap.get(canonId) || chat.name || chat.subject || null;
 
-            const origChatId = cn;
-            const legacyChatIds =
-                origChatId && canonicalChatId && origChatId !== canonicalChatId ? [origChatId] : [];
-
-            return {
-                id: canonicalChatId,
-                legacy_chat_ids: legacyChatIds,
-                name: resolvedName,
-                avatar_url: avatarUrl,
-                messages: chatMessages,
-                last_message_preview: previewText, // Pass this explicitly to Laravel
-                latestMessageTimestamp: chatMessages.length > 0 ? chatMessages[0].timestamp : fallbackTs
+            const row = {
+                id:                     canonId,
+                legacy_chat_ids:        legacyIds,
+                name:                   resolvedName,
+                avatar_url:             avatarUrl,
+                messages:               topMsgs,
+                last_message_preview:   preview,
+                latestMessageTimestamp: latestTs,
             };
-        }));
 
-        // Merge rows that normalized to the same canonical JID (LID + PN duplicates)
-        const mergedMap = new Map();
-        for (const row of syncData.sort((a, b) => b.latestMessageTimestamp - a.latestMessageTimestamp)) {
-            const id = row.id;
-            if (!mergedMap.has(id)) {
-                mergedMap.set(id, row);
-                continue;
+            if (stillLid) {
+                getLidPlaceholders(sid).set(chatNorm, row);
+                placeholds.push(row);
+            } else {
+                resolved.push(row);
             }
-            const prev = mergedMap.get(id);
-            const seen = new Set(prev.messages.map(m => m.id));
-            for (const m of row.messages) {
-                if (!seen.has(m.id)) {
-                    prev.messages.push(m);
-                    seen.add(m.id);
-                }
-            }
+        }
+
+        // Merge duplicate canonical JIDs
+        const mergeMap = new Map();
+        for (const row of resolved.sort((a, b) => b.latestMessageTimestamp - a.latestMessageTimestamp)) {
+            if (!mergeMap.has(row.id)) { mergeMap.set(row.id, row); continue; }
+            const prev   = mergeMap.get(row.id);
+            const seenMs = new Set(prev.messages.map(m => m.id));
+            for (const m of row.messages) if (!seenMs.has(m.id)) { prev.messages.push(m); seenMs.add(m.id); }
             prev.messages.sort((a, b) => b.timestamp - a.timestamp);
             if (prev.messages.length > 100) prev.messages = prev.messages.slice(0, 100);
             if (row.latestMessageTimestamp > prev.latestMessageTimestamp) {
                 prev.latestMessageTimestamp = row.latestMessageTimestamp;
-                prev.last_message_preview = row.last_message_preview;
+                prev.last_message_preview   = row.last_message_preview;
             }
-            if (row.name && !prev.name) prev.name = row.name;
+            if (row.name && !prev.name)             prev.name       = row.name;
             if (row.avatar_url && !prev.avatar_url) prev.avatar_url = row.avatar_url;
-            const leg = [...new Set([...(prev.legacy_chat_ids || []), ...(row.legacy_chat_ids || [])])];
-            prev.legacy_chat_ids = leg;
+            prev.legacy_chat_ids = [...new Set([...(prev.legacy_chat_ids || []), ...(row.legacy_chat_ids || [])])];
         }
-        const finalSync = Array.from(mergedMap.values()).sort((a, b) => b.latestMessageTimestamp - a.latestMessageTimestamp);
 
-        try {
-            await axios.post(LARAVEL_API_ROUTES.chatHistorySync, {
-                account_id: sessionId,
-                conversations: finalSync
-            });
-            console.log(`[HISTORY] Successfully synced ${finalSync.length} conversations for account ${sessionId}`);
-        } catch (err) {
-            console.error(`[HISTORY] Sync failed for account ${sessionId}:`, err.message);
+        const finalResolved = Array.from(mergeMap.values())
+            .sort((a, b) => b.latestMessageTimestamp - a.latestMessageTimestamp);
+
+        console.log(`[HISTORY] Posting: ${finalResolved.length} resolved | ${placeholds.length} @lid placeholders pending`);
+
+        if (finalResolved.length) await postHistoryBatch(sessionId, finalResolved);
+
+        // Schedule MULTIPLE retry waves for @lid placeholders
+        if (placeholds.length) {
+            console.log(`[LID-RETRY] ${placeholds.length} @lid chats queued. Retry waves: 5s, 15s, 30s, 60s`);
+            const wave = (label) => async () => {
+                const n = await flushLidPlaceholders(sid, socket);
+                const rem = getLidPlaceholders(sid).size;
+                console.log(`[LID-RETRY ${label}] Flushed: ${n} | Remaining: ${rem}`);
+            };
+            addRetryTimer(sid, wave('5s'),  5_000);
+            addRetryTimer(sid, wave('15s'), 15_000);
+            addRetryTimer(sid, wave('30s'), 30_000);
+            addRetryTimer(sid, wave('60s'), 60_000);
         }
     });
 
-    // Listen for incoming and outgoing messages
+    // ── messages.upsert ──────────────────────────────────────────────────────
     socket.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        
-        // Listen for all notify type messages (even from self)
-        if (m.type === 'notify') {
-            const rawJid = msg.key.remoteJid;
-            const isFromMe = msg.key.fromMe;
-            
-            // IGNORE Status updates, groups, etc.
-            if (rawJid === 'status@broadcast' || rawJid.includes('@g.us')) {
-                return;
-            }
+        if (m.type !== 'notify') return;
+        const msg    = m.messages[0];
+        const rawJid = msg?.key?.remoteJid;
+        if (!rawJid) return;
+        if (rawJid === 'status@broadcast'  ||
+            rawJid.includes('@newsletter') ||
+            rawJid.includes('@broadcast'))  return;
 
-            const text = getMessageText(msg);
+        const text = getMessageText(msg);
+        if (!text) return;
 
-            if (text) {
-                const senderJid = await canonicalUserJidFromParts(
-                    socket,
-                    msg.key.remoteJid,
-                    msg.key.remoteJidAlt
-                );
-                const pushName = msg.pushName || null;
-                let avatarUrl = null;
+        const isFromMe = msg.key.fromMe;
+        const isGroupChat = rawJid.includes('@g.us');
+        const lidMap   = getLidMap(sid);
 
-                // Only fetch avatar for incoming messages; use phone JID first (works with privacy settings)
-                if (!isFromMe) {
-                    try {
-                        avatarUrl = await socket.profilePictureUrl(senderJid, 'image').catch(() => null);
-                        if (!avatarUrl) {
-                            avatarUrl = await socket.profilePictureUrl(rawJid, 'image').catch(() => null);
-                        }
-                    } catch (e) {}
-                }
+        // Cross-pair remoteJid/remoteJidAlt from this live message
+        feedLidMap(lidMap, { messages: [msg] });
 
-                const tsSec = msg.messageTimestamp != null
-                    ? Number(msg.messageTimestamp)
-                    : Math.floor(Date.now() / 1000);
+        const senderJid = await resolveJid(socket, msg.key.remoteJid, msg.key.remoteJidAlt, lidMap);
 
-                console.log(`[SYNC] Account ${sessionId} | ${isFromMe ? 'SENT' : 'RECEIVE'} | JID: ${senderJid} (raw ${rawJid}) | Msg: ${text}`);
+        // If this live message resolved an @lid, update map and flush placeholders
+        const rawNorm = safeNorm(rawJid);
+        if (isLidUser(rawNorm) && isPnUser(safeNorm(senderJid))) {
+            lidMap.set(rawNorm, safeNorm(senderJid));
+            flushLidPlaceholders(sid, socket).catch(() => {});
+        }
+
+        const pushName = msg.pushName || null;
+        const effectiveContactName = (!isFromMe && !isGroupChat) ? pushName : null;
+        let avatarUrl  = null;
+        if (!isFromMe) {
+            avatarUrl = await socket.profilePictureUrl(senderJid, 'image')
+                .catch(() => socket.profilePictureUrl(rawJid, 'image').catch(() => null));
+        }
+
+        const tsSec = msg.messageTimestamp != null
+            ? Number(msg.messageTimestamp)
+            : Math.floor(Date.now() / 1000);
+
+        console.log(`[MSG] ${sid} | ${isFromMe ? 'OUT' : 'IN'} | ${senderJid} | "${text.substring(0, 60)}"`);
+
+        try {
+            const response = await axios.post(API.receiveMessage, {
+                account_id:        sessionId,
+                phone:             senderJid,
+                jid_raw:           rawJid,
+                contact_name:      effectiveContactName,
+                avatar_url:        avatarUrl,
+                message:           text,
+                whatsapp_id:       msg.key.id,
+                message_timestamp: tsSec,
+                is_from_me:        isFromMe,
+            });
+
+            // Real-time backfill
+            axios.post(API.historySync, {
+                account_id:    sessionId,
+                conversations: [{
+                    id:                     senderJid,
+                    legacy_chat_ids:        (rawNorm && rawNorm !== senderJid) ? [rawNorm] : [],
+                    name:                   effectiveContactName,
+                    avatar_url:             isFromMe ? null : avatarUrl,
+                    messages:               [{ id: msg.key.id, text, timestamp: tsSec, fromMe: isFromMe }],
+                    latestMessageTimestamp: tsSec,
+                    last_message_preview:   text,
+                }],
+            }).catch(e => console.error('[MSG] backfill failed:', e.message));
+
+            // AI auto-reply
+            if (!isFromMe && response.data.ai_reply) {
+                const aiReply  = response.data.ai_reply;
+                const dedupKey = `${sid}:${msg?.key?.id || `${rawJid}:${tsSec}`}`;
+                const now      = Date.now();
+                for (const [k, exp] of autoReplyDedup) if (exp <= now) autoReplyDedup.delete(k);
+                if (autoReplyDedup.has(dedupKey)) return;
+                autoReplyDedup.set(dedupKey, now + 15 * 60_000);
+
+                await socket.readMessages([msg.key]);
+                await delay(Math.min(Math.max(aiReply.length * 40, 3000), 8000));
+                console.log(`[AUTO-REPLY] → ${senderJid}`);
+
+                try { if (typeof socket.presenceObserve   === 'function') await socket.presenceObserve(senderJid); }   catch (_) {}
+                try { if (typeof socket.sendPresenceUpdate === 'function') await socket.sendPresenceUpdate('composing', senderJid); } catch (_) {}
+                await delay(Math.min(Math.max(aiReply.length * 50, 2000), 7000));
+                try { if (typeof socket.sendPresenceUpdate === 'function') await socket.sendPresenceUpdate('paused', senderJid); } catch (_) {}
+
+                const sentMsg = await socket.sendMessage(senderJid, { text: aiReply });
 
                 try {
-                    // Send to Laravel
-                    const response = await axios.post(LARAVEL_API_ROUTES.chatReceiveMessage, {
-                        account_id: sessionId,
-                        phone: senderJid,
-                        jid_raw: rawJid,
-                        contact_name: pushName,
-                        avatar_url: avatarUrl,
-                        message: text,
-                        whatsapp_id: msg.key.id,
-                        message_timestamp: tsSec,
-                        is_from_me: isFromMe // Identify who sent it
+                    await axios.post(API.receiveMessage, {
+                        account_id:        sessionId,
+                        phone:             senderJid,
+                        jid_raw:           rawJid,
+                        contact_name:      effectiveContactName,
+                        avatar_url:        avatarUrl,
+                        message:           aiReply,
+                        whatsapp_id:       sentMsg?.key?.id || null,
+                        message_timestamp: Math.floor(Date.now() / 1000),
+                        is_from_me:        true,
                     });
-
-                    // ONLY Handle AI Auto-reply IF NOT from Me
-                    if (!isFromMe && response.data.ai_reply) {
-                        const aiReply = response.data.ai_reply;
-                        const incomingMsgId = msg?.key?.id
-                            ? String(msg.key.id)
-                            : `${rawJid}:${tsSec}:${text}`;
-                        const dedupKey = `${sessionId}:${incomingMsgId}`;
-                        const now = Date.now();
-
-                        // Remove expired keys (15 min TTL) to keep memory bounded.
-                        for (const [key, expiresAt] of autoReplyDedup.entries()) {
-                            if (expiresAt <= now) {
-                                autoReplyDedup.delete(key);
-                            }
-                        }
-                        if (autoReplyDedup.has(dedupKey)) {
-                            console.log(`[AUTO-REPLY] Skip duplicate trigger for ${dedupKey}`);
-                            return;
-                        }
-                        autoReplyDedup.set(dedupKey, now + (15 * 60 * 1000));
-                        
-                        // --- RISK MITIGATION / HUMAN BEHAVIOR ---
-                        
-                        // 1. Mark as Read (Presence)
-                        await socket.readMessages([msg.key]);
-                        
-                        // 2. Fixed response delay as requested: 10 seconds.
-                        await delay(10000);
-                        
-                        console.log(`[AUTO-REPLY] Sending to ${senderJid}: ${aiReply}`);
-                        
-                        // 3. Send with typing indicator but no extra delay (already waited 10s).
-                        // Always send to canonical phone JID so mirrored fromMe event
-                        // maps back to the same conversation in Laravel/UI.
-                        const sentAuto = await sendWithTyping(socket, senderJid, aiReply, 'composing', 0);
-
-                        // 4. Persist immediately in Laravel so UI shows AI reply even if
-                        // fromMe mirror upsert arrives late or is skipped by provider behavior.
-                        try {
-                            const persistRes = await axios.post(LARAVEL_API_ROUTES.chatReceiveMessage, {
-                                account_id: sessionId,
-                                phone: senderJid,
-                                // Keep original raw jid so Laravel can merge any lingering
-                                // @lid duplicate conversation into canonical phone thread.
-                                jid_raw: rawJid,
-                                contact_name: pushName,
-                                avatar_url: avatarUrl,
-                                message: aiReply,
-                                whatsapp_id: sentAuto?.key?.id || null,
-                                message_timestamp: Math.floor(Date.now() / 1000),
-                                is_from_me: true
-                            });
-                            console.log(`[AUTO-REPLY] Persisted in Laravel for ${senderJid} (status ${persistRes.status})`);
-                        } catch (persistErr) {
-                            console.error('[AUTO-REPLY] Persist failed:', persistErr.message);
-                        }
-                    } else if (!isFromMe) {
-                        const reason = response?.data?.ai_skip_reason || 'none';
-                        console.log(`[AUTO-REPLY] Not generated for ${senderJid} (reason: ${reason})`);
-                    }
-                } catch (error) {
-                    console.error('[SYNC] Laravel Error:', error.message);
-                }
+                } catch (e) { console.error('[AUTO-REPLY] persist failed:', e.message); }
+            } else if (!isFromMe) {
+                console.log(`[AUTO-REPLY] Skipped (${response?.data?.ai_skip_reason || 'none'})`);
             }
+        } catch (err) {
+            console.error('[MSG] Laravel error:', err.message);
         }
+    });
+
+    // ── Heartbeat ────────────────────────────────────────────────────────────
+    const hb = setInterval(async () => {
+        try { if (socket.user) await socket.groupFetchAllParticipating().catch(() => {}); } catch (_) {}
+    }, 60_000);
+    socket.ev.on('connection.update', ({ connection }) => {
+        if (connection === 'close') clearInterval(hb);
     });
 
     return socket;
 }
 
-/**
- * Endpoint: Initialize/Start session
- */
+// ── REST API ─────────────────────────────────────────────────────────────────
+
 app.post('/sessions/:id', async (req, res) => {
-    const sessionId = req.params.id;
-    
-    if (sessions.has(sessionId)) {
-        return res.json({ status: 'active', message: 'Session already running' });
-    }
-
+    const id = req.params.id;
+    if (sessions.has(id)) return res.json({ status: 'active', message: 'Already running' });
     try {
-        await initSession(sessionId);
-        res.json({ status: 'initializing', message: 'Session initialization started' });
-    } catch (err) {
-        res.status(500).json({ status: 'error', message: err.message });
-    }
+        await initSession(id);
+        res.json({ status: 'initializing', message: 'Session started' });
+    } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
 
-/**
- * Endpoint: Delete/Stop session and cleanup files
- */
 app.delete('/sessions/:id', async (req, res) => {
-    const sessionId = req.params.id;
-    console.log(`[DELETE] Request to cleanup session: ${sessionId}`);
-    
-    const socket = sessions.get(sessionId.toString());
-    if (socket) {
-        try {
-            socket.logout(); // This also triggers connection.update with loggedOut
-            sessions.delete(sessionId.toString());
-        } catch (e) { console.error(`[DELETE] Error logging out socket: ${e.message}`); }
-    }
-
-    // Permanently remove the session directory
-    const sessionDir = path.join(__dirname, 'sessions', sessionId.toString());
-    if (fs.existsSync(sessionDir)) {
-        try {
-            fs.rmSync(sessionDir, { recursive: true, force: true });
-            console.log(`[DELETE] Session directory removed for ${sessionId}`);
-        } catch (e) { console.error(`[DELETE] Error removing directory: ${e.message}`); }
-    }
-
-    res.json({ status: 'success', message: `Session ${sessionId} deleted and cleaned up` });
+    const id   = req.params.id;
+    const sock = sessions.get(id);
+    if (sock) { try { sock.logout(); } catch (_) {} sessions.delete(id); }
+    lidMaps.delete(id);
+    lidPlaceholders.delete(id);
+    clearRetryTimers(id);
+    const dir = path.join(__dirname, 'sessions', id);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    res.json({ status: 'success', message: `Session ${id} deleted` });
 });
 
-/**
- * Endpoint: Send message
- */
 app.post('/send-message', async (req, res) => {
-    let { account_id, phone, message } = req.body;
-    
-    const socket = sessions.get(account_id.toString());
-    if (!socket) {
-        console.error(`[SEND] FAILED: Account ${account_id} not running`);
-        return res.status(404).json({ error: `Account ${account_id} is not running. Please start it.` });
-    }
+    const { account_id, phone, message } = req.body;
+    const socket = sessions.get(String(account_id));
+    if (!socket) return res.status(404).json({ error: `Account ${account_id} not running` });
 
-    // Determine the correct JID (prefer real phone @s.whatsapp.net over @lid from stale UI state)
     let jid = String(phone || '').trim();
     if (!jid.includes('@')) {
-        const cleanPhone = jid.replace(/\D/g, '');
-        jid = `${cleanPhone}@s.whatsapp.net`;
+        jid = `${jid.replace(/\D/g, '')}@s.whatsapp.net`;
     } else {
-        jid = jidNormalizedUser(jid);
+        jid = safeNorm(jid);
         if (isLidUser(jid)) {
-            const resolved = await canonicalUserJidFromParts(socket, jid, undefined, null);
-            if (resolved && isPnUser(resolved)) {
-                jid = resolved;
-            }
+            const r = await resolveJid(socket, jid, undefined, getLidMap(account_id));
+            if (r && isPnUser(safeNorm(r))) jid = r;
         }
     }
 
-    console.log(`[SEND] Final JID for account ${account_id}: ${jid}`);
-    
     try {
         const sent = await socket.sendMessage(jid, { text: message });
-        const messageId = sent?.key?.id || null;
-        const timestamp = Math.floor(Date.now() / 1000);
-        console.log(`[SEND] SUCCESS for account ${account_id} -> ${jid}`);
-        res.json({ status: 'success', jid, message_id: messageId, timestamp });
-    } catch (error) {
-        console.error(`[SEND] ERROR for account ${account_id}:`, error.message);
-        res.status(500).json({ error: error.message });
-    }
+        res.json({ status: 'success', jid, message_id: sent?.key?.id || null, timestamp: Math.floor(Date.now() / 1000) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/**
- * Endpoint: Get sessions status
- */
+// Force-flush any remaining @lid placeholders
+app.post('/sessions/:id/resync', async (req, res) => {
+    const id   = req.params.id;
+    const sock = sessions.get(id);
+    if (!sock) return res.status(404).json({ error: 'Session not running' });
+    const n = await flushLidPlaceholders(id, sock);
+    res.json({ status: 'ok', flushed: n, remaining: getLidPlaceholders(id).size });
+});
+
+// Debug: inspect current LID map
+app.get('/sessions/:id/lid-map', (req, res) => {
+    const map = getLidMap(req.params.id);
+    const out = {};
+    for (const [k, v] of map) out[k] = v;
+    res.json({ size: map.size, entries: out });
+});
+
+// Debug: inspect pending @lid placeholders
+app.get('/sessions/:id/placeholders', (req, res) => {
+    const pmap = getLidPlaceholders(req.params.id);
+    const out  = [];
+    for (const [k, v] of pmap) out.push({ lid: k, name: v.name, preview: v.last_message_preview });
+    res.json({ count: pmap.size, placeholders: out });
+});
+
 app.get('/sessions', (req, res) => {
-    const status = {};
-    for (const [id, socket] of sessions) {
-        status[id] = 'active';
-    }
-    res.json(status);
+    const out = {};
+    for (const [id] of sessions) out[id] = 'active';
+    res.json(out);
 });
 
-/**
- * Quick browser check endpoint
- */
-app.get('/', (req, res) => {
-    res.status(200).send('whatsapp-node is running');
-});
+app.get('/',        (_, res) => res.status(200).send('whatsapp-node is running'));
+app.get('/health',  (_, res) => res.status(200).json({ status: 'ok', active_sessions: sessions.size }));
+app.get('/healthz', (_, res) => res.status(200).send('ok'));
+app.get('/status',  (_, res) => res.status(200).json({
+    status: 'running', service: 'whatsapp-node',
+    boot_time: bootTime, now: new Date().toISOString(),
+    active_sessions: sessions.size, uptime_seconds: Math.floor(process.uptime()),
+}));
 
-/**
- * Health checks for Render and uptime monitoring
- */
-app.get('/health', (req, res) => {
-    res.status(200).json({
-        status: 'ok',
-        service: 'whatsapp-node',
-        active_sessions: sessions.size
-    });
-});
-
-app.get('/healthz', (req, res) => {
-    res.status(200).send('ok');
-});
-
-/**
- * Detailed runtime status endpoint
- */
-app.get('/status', (req, res) => {
-    res.status(200).json({
-        status: 'running',
-        service: 'whatsapp-node',
-        boot_time: bootTime,
-        now: new Date().toISOString(),
-        active_sessions: sessions.size,
-        uptime_seconds: Math.floor(process.uptime())
-    });
-});
-
-// Start Express Server
+// ── Boot ─────────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
-    console.log(`Multi-Session WhatsApp Bridge running on port ${PORT}`);
-    
-    // AUTO-RESUME: Reconnect all accounts found in the sessions directory
-    const sessionsDir = path.join(__dirname, 'sessions');
-    if (fs.existsSync(sessionsDir)) {
-        const folders = fs.readdirSync(sessionsDir);
+    console.log(`[BOOT] WhatsApp Bridge on port ${PORT}`);
+    const sessDir = path.join(__dirname, 'sessions');
+    if (fs.existsSync(sessDir)) {
+        const folders = fs.readdirSync(sessDir)
+            .filter(f => fs.statSync(path.join(sessDir, f)).isDirectory());
         for (const folder of folders) {
-            console.log(`[BOOT] Auto-resuming session: ${folder}`);
+            console.log(`[BOOT] Resuming session: ${folder}`);
             await initSession(folder);
+            await delay(2000);
         }
     }
 });
