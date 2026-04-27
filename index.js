@@ -31,7 +31,7 @@ const app = express();
 app.use(express.json());
 const bootTime = new Date().toISOString();
 
-const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://127.0.0.1:8000/api';
+const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'https://quickmed.technoderivation.com/technochain/api';
 const API = {
     qrStore:        `${LARAVEL_API_URL}/sessions/qr`,
     statusUpdate:   (id) => `${LARAVEL_API_URL}/accounts/${id}/status`,
