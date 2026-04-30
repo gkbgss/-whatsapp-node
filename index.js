@@ -31,6 +31,7 @@ const app = express();
 app.use(express.json());
 const bootTime = new Date().toISOString();
 
+
 const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'https://myaibusinessagent.in/whatsapp-inbox/api';
 const API = {
     qrStore:        `${LARAVEL_API_URL}/sessions/qr`,
@@ -38,6 +39,7 @@ const API = {
     profileSync:    (id) => `${LARAVEL_API_URL}/accounts/${id}/sync-profile`,
     historySync:    `${LARAVEL_API_URL}/sync-history`,
     receiveMessage: `${LARAVEL_API_URL}/receive-message`,
+    messageStatus:  `${LARAVEL_API_URL}/message-status`,
 };
 
 // ── Global stores ────────────────────────────────────────────────────────────
@@ -51,9 +53,11 @@ const lidMaps = new Map(); // sessionId → Map<normalizedLidJid, normalizedPnJi
 
 // Unresolved @lid chat placeholders waiting to be patched when contacts arrive
 const lidPlaceholders = new Map(); // sessionId → Map<lidJid, chatRowData>
+const historyReady = new Set();    // sessionId that completed first history sync
 
 // Retry timers for each session
 const retryTimers = new Map(); // sessionId → [timeoutId, ...]
+const syncFallbackTimers = new Map(); // sessionId -> timeoutId
 
 function getLidMap(sid) {
     const k = String(sid);
@@ -75,6 +79,29 @@ function addRetryTimer(sid, fn, ms) {
     const k = String(sid);
     if (!retryTimers.has(k)) retryTimers.set(k, []);
     retryTimers.get(k).push(setTimeout(fn, ms));
+}
+function clearSyncFallbackTimer(sid) {
+    const k = String(sid);
+    const timer = syncFallbackTimers.get(k);
+    if (timer) clearTimeout(timer);
+    syncFallbackTimers.delete(k);
+}
+function scheduleSyncFallback(sessionId, sid, phoneNumber) {
+    clearSyncFallbackTimer(sid);
+    const timer = setTimeout(async () => {
+        // If history callback did not arrive, still move out of syncing.
+        if (historyReady.has(sid) || !sessions.has(sid)) return;
+        try {
+            await axios.patch(API.statusUpdate(sessionId), { status: 'active', phone_number: phoneNumber || null });
+            historyReady.add(sid);
+            console.log(`[STATUS] ${sid}: fallback activated, account marked active`);
+        } catch (e) {
+            console.error(`[STATUS] ${sid}: fallback active update failed - ${e.message}`);
+        } finally {
+            syncFallbackTimers.delete(sid);
+        }
+    }, 25000);
+    syncFallbackTimers.set(String(sid), timer);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -297,11 +324,20 @@ async function initSession(sessionId) {
     socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (qr) {
             console.log(`[QR] ${sid}`);
-            try { await axios.post(API.qrStore, { account_id: sessionId, qr }); } catch (e) {}
+            try {
+                await axios.post(API.qrStore, { account_id: sessionId, qr }, { timeout: 15000 });
+                console.log(`[QR] Stored in Laravel for account ${sid}`);
+            } catch (e) {
+                const status = e?.response?.status ?? 'no-status';
+                const body = e?.response?.data ?? e.message;
+                console.error(`[QR] Failed to store for account ${sid} -> ${API.qrStore} | ${status} | ${JSON.stringify(body)}`);
+            }
         }
 
         if (connection === 'close') {
             clearRetryTimers(sid);
+            clearSyncFallbackTimer(sid);
+            historyReady.delete(sid);
             const code = (lastDisconnect?.error instanceof Boom)
                 ? lastDisconnect.error?.output?.statusCode : null;
             const reconnect = code !== DisconnectReason.loggedOut;
@@ -314,6 +350,8 @@ async function initSession(sessionId) {
                 sessions.delete(sid);
                 lidMaps.delete(sid);
                 lidPlaceholders.delete(sid);
+                const dir = path.join(__dirname, 'sessions', sid);
+                if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
                 try {
                     await axios.patch(API.statusUpdate(sessionId), { status: 'disconnected', phone_number: null });
                 } catch (_) {}
@@ -325,7 +363,9 @@ async function initSession(sessionId) {
             const myAvatar = await socket.profilePictureUrl(socket.user.id, 'image').catch(() => null);
             try {
                 await axios.post(API.profileSync(sessionId), { phone: me, user_name: myName, avatar_url: myAvatar });
-                await axios.patch(API.statusUpdate(sessionId), { status: 'active', phone_number: me });
+                // Keep UI in "syncing" until first history batch lands.
+                await axios.patch(API.statusUpdate(sessionId), { status: 'syncing', phone_number: me });
+                scheduleSyncFallback(sessionId, sid, me);
             } catch (e) { console.error('[PROFILE]', e.message); }
         }
     });
@@ -528,6 +568,19 @@ async function initSession(sessionId) {
 
         if (finalResolved.length) await postHistoryBatch(sessionId, finalResolved);
 
+        // Mark active only after first history sync; this prevents empty UI right after QR.
+        if (!historyReady.has(sid)) {
+            historyReady.add(sid);
+            clearSyncFallbackTimer(sid);
+            try {
+                const me = socket?.user?.id ? String(socket.user.id).split(':')[0] : null;
+                await axios.patch(API.statusUpdate(sessionId), { status: 'active', phone_number: me });
+                console.log(`[HISTORY] ${sid}: first sync done, account marked active`);
+            } catch (e) {
+                console.error(`[HISTORY] ${sid}: failed to mark active - ${e.message}`);
+            }
+        }
+
         // Schedule MULTIPLE retry waves for @lid placeholders
         if (placeholds.length) {
             console.log(`[LID-RETRY] ${placeholds.length} @lid chats queued. Retry waves: 5s, 15s, 30s, 60s`);
@@ -599,20 +652,6 @@ async function initSession(sessionId) {
                 is_from_me:        isFromMe,
             });
 
-            // Real-time backfill
-            axios.post(API.historySync, {
-                account_id:    sessionId,
-                conversations: [{
-                    id:                     senderJid,
-                    legacy_chat_ids:        (rawNorm && rawNorm !== senderJid) ? [rawNorm] : [],
-                    name:                   effectiveContactName,
-                    avatar_url:             isFromMe ? null : avatarUrl,
-                    messages:               [{ id: msg.key.id, text, timestamp: tsSec, fromMe: isFromMe }],
-                    latestMessageTimestamp: tsSec,
-                    last_message_preview:   text,
-                }],
-            }).catch(e => console.error('[MSG] backfill failed:', e.message));
-
             // AI auto-reply
             if (!isFromMe && response.data.ai_reply) {
                 const aiReply  = response.data.ai_reply;
@@ -654,6 +693,32 @@ async function initSession(sessionId) {
         }
     });
 
+    // ── messages.update (delivery/read receipts) ─────────────────────────────
+    socket.ev.on('messages.update', async (updates) => {
+        for (const update of updates || []) {
+            const waId = update?.key?.id;
+            if (!waId) continue;
+
+            // Baileys status can come as numeric update.status/update.update?.status
+            const rawAck =
+                typeof update?.status === 'number'
+                    ? update.status
+                    : (typeof update?.update?.status === 'number' ? update.update.status : null);
+            if (rawAck === null) continue;
+
+            const ack = Math.max(0, Math.min(4, Number(rawAck)));
+            try {
+                await axios.post(API.messageStatus, {
+                    account_id: sessionId,
+                    whatsapp_id: waId,
+                    ack,
+                }, { timeout: 15000 });
+            } catch (e) {
+                console.error(`[ACK] Failed for ${waId}:`, e?.response?.data || e.message);
+            }
+        }
+    });
+
     // ── Heartbeat ────────────────────────────────────────────────────────────
     const hb = setInterval(async () => {
         try { if (socket.user) await socket.groupFetchAllParticipating().catch(() => {}); } catch (_) {}
@@ -683,6 +748,8 @@ app.delete('/sessions/:id', async (req, res) => {
     lidMaps.delete(id);
     lidPlaceholders.delete(id);
     clearRetryTimers(id);
+    clearSyncFallbackTimer(id);
+    historyReady.delete(id);
     const dir = path.join(__dirname, 'sessions', id);
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     res.json({ status: 'success', message: `Session ${id} deleted` });
@@ -690,8 +757,19 @@ app.delete('/sessions/:id', async (req, res) => {
 
 app.post('/send-message', async (req, res) => {
     const { account_id, phone, message } = req.body;
-    const socket = sessions.get(String(account_id));
-    if (!socket) return res.status(404).json({ error: `Account ${account_id} not running` });
+    let socket = sessions.get(String(account_id));
+    if (!socket) {
+        // Auto-recover: if in-memory session is missing, re-initialize from saved creds.
+        try {
+            await initSession(String(account_id));
+            socket = sessions.get(String(account_id));
+        } catch (e) {
+            return res.status(500).json({ error: `Failed to recover session ${account_id}: ${e.message}` });
+        }
+    }
+    if (!socket) {
+        return res.status(503).json({ error: `Session ${account_id} is initializing. Please retry in a few seconds.` });
+    }
 
     let jid = String(phone || '').trim();
     if (!jid.includes('@')) {
