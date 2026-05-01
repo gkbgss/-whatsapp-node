@@ -31,12 +31,6 @@
     app.use(express.json());
     const bootTime = new Date().toISOString();
 
-    function isSocketReady(socket) {
-        // Baileys can hydrate user before WS is actually ready after reconnect.
-        return Boolean(socket?.user?.id) && socket?.ws?.readyState === 1;
-    }
-
-
     const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'https://myaibusinessagent.in/whatsapp-inbox/api';
     const API = {
         qrStore:        `${LARAVEL_API_URL}/sessions/qr`,
@@ -50,6 +44,7 @@
 
     // ── Global stores ────────────────────────────────────────────────────────────
     const sessions       = new Map();  // sessionId → socket
+const sessionStates  = new Map();  // sessionId → 'open' | 'close' | 'connecting'
     const autoReplyDedup = new Map();  // dedupKey  → expiresAt
 
     // PERSISTENT LID→PN map per session. Never recreated, only grows.
@@ -64,6 +59,13 @@
     // Retry timers for each session
     const retryTimers = new Map(); // sessionId → [timeoutId, ...]
     const syncFallbackTimers = new Map(); // sessionId -> timeoutId
+
+function isSocketReady(sid, socket) {
+    // Prefer event-driven connection state; ws.readyState may differ by Baileys/runtime.
+    const state = sessionStates.get(String(sid));
+    if (state === 'open' && socket?.user?.id) return true;
+    return Boolean(socket?.user?.id) && socket?.ws?.readyState === 1;
+}
 
     function getLidMap(sid) {
         const k = String(sid);
@@ -324,10 +326,14 @@
         });
 
         sessions.set(sid, socket);
+    sessionStates.set(sid, 'connecting');
         socket.ev.on('creds.update', saveCreds);
 
         // ── connection.update ────────────────────────────────────────────────────
         socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+        if (connection === 'open' || connection === 'close' || connection === 'connecting') {
+            sessionStates.set(sid, connection);
+        }
             if (qr) {
                 console.log(`[QR] ${sid}`);
                 try {
@@ -356,6 +362,7 @@
                     initSession(sessionId);
                 } else {
                     sessions.delete(sid);
+                sessionStates.delete(sid);
                     lidMaps.delete(sid);
                     lidPlaceholders.delete(sid);
                     const dir = path.join(__dirname, 'sessions', sid);
@@ -792,6 +799,7 @@
         const id   = req.params.id;
         const sock = sessions.get(id);
         if (sock) { try { sock.logout(); } catch (_) {} sessions.delete(id); }
+    sessionStates.delete(id);
         lidMaps.delete(id);
         lidPlaceholders.delete(id);
         clearRetryTimers(id);
@@ -817,7 +825,7 @@
         }
 
         // Session object exists but is not fully ready yet (common after reconnect).
-        if (socket && !isSocketReady(socket)) {
+    if (socket && !isSocketReady(sid, socket)) {
             try {
                 await initSession(sid);
             } catch (_) {}
@@ -827,7 +835,7 @@
         if (!socket) {
             return res.status(503).json({ error: `Session ${account_id} is initializing. Please retry in a few seconds.` });
         }
-        if (!isSocketReady(socket)) {
+    if (!isSocketReady(sid, socket)) {
             return res.status(503).json({ error: `Session ${account_id} is reconnecting. Please retry in a few seconds.` });
         }
 
