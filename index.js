@@ -762,7 +762,8 @@ app.delete('/sessions/:id', async (req, res) => {
 
 app.post('/send-message', async (req, res) => {
     const { account_id, phone, message } = req.body;
-    let socket = sessions.get(String(account_id));
+    const sid = String(account_id);
+    let socket = sessions.get(sid);
     if (!socket) {
         // Auto-recover: if in-memory session is missing, re-initialize from saved creds.
         try {
