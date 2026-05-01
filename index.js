@@ -358,9 +358,15 @@ async function initSession(sessionId) {
             }
         } else if (connection === 'open') {
             console.log(`[SESSION] Connected: ${sid}`);
-            const me     = socket.user.id.split(':')[0];
-            const myName = socket.user.name || null;
-            const myAvatar = await socket.profilePictureUrl(socket.user.id, 'image').catch(() => null);
+            const meJid = socket?.user?.id ? String(socket.user.id) : null;
+            if (!meJid) {
+                // Rare race after reconnect: connection opens before socket.user is hydrated.
+                console.warn(`[SESSION] ${sid}: connected but user JID not ready; skipping profile sync.`);
+                return;
+            }
+            const me = meJid.split(':')[0];
+            const myName = socket?.user?.name || null;
+            const myAvatar = await socket.profilePictureUrl(meJid, 'image').catch(() => null);
             try {
                 await axios.post(API.profileSync(sessionId), { phone: me, user_name: myName, avatar_url: myAvatar });
                 // Keep UI in "syncing" until first history batch lands.
