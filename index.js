@@ -414,8 +414,7 @@ async function initSession(sessionId) {
     });
 
     // ── messaging-history.set ────────────────────────────────────────────────
-    socket.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
-        console.log(`[HISTORY] ${sid}: ${chats.length} chats | ${contacts.length} contacts | ${messages.length} msgs`);
+    socket.ev.on('messaging-history.set', async ({ chats, contacts, messages } = {}) => {
 
         const lidMap = getLidMap(sid);
 
